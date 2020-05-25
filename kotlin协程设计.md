@@ -2,12 +2,14 @@
 
 ## 译者前言
 
-吾师从《APUE》《TCP/IP Illustrated》之W.Richard Stevens, 乐读spec之原文，辨细节之是非。今于稚子酣睡之际，译《Kotlin Coroutines》一文。予少有译文，其因有四：
+吾师从《APUE》、《TCP/IP Illustrated》之W.Richard Stevens, 乐读spec之原文，辨细节之是非。今于稚子酣睡之际，译《Kotlin Coroutines》一文。予少有译文，其因有四：
 
 * 英文半通，吾之失也
 * 汉语退化，国之失也
 * 费我光阴，事小
 * 误人子弟，事大
+
+然见诸博客，管中窥豹者多，以讹传讹者众。译文虽亦属二手之资料，尚有原文可溯源，谬误亦可纠也。
 
 
 
@@ -580,3 +582,36 @@ interface SequenceScope<in T> {
 }
 ```
 
+此注解为`sequence{}`或类似的同步协程builder内的挂起函数添加了一些限制条件。以`@RestrictsSuspension` scope为receiver的扩展函数或扩展lambda称为有限制的挂起函数。有限制的挂起函数只能调用同一个有限制scope内的其他挂起函数。
+
+特别要提及的是，`SequenceScope`的扩展函数不能调用`suspendContinuation`或其他通用挂起函数。想要挂起`sequence`协程的执行，必须调用`SequenceScope.yield`. `yield`自身是`SequenceScope`的成员函数，不受前述限制条件影响（只有扩展函数和扩展lambda受限制）。
+
+像`sequnce`这类有限制的协程builder，支持任意的协程上下文是没意义的，scope类或接口（例如`SequenceScope`）就可以看成是协程的上下文。因此，有限制的协程必须使用`EmptyCoroutineContext`作为它们的上下文，`SequenceScope.context`返回的就是`EmptyCoroutineContext`. 用其他context创建有限制的协程，会抛出`IllegalArgumentException`异常。
+
+
+
+## 协程实施细节
+
+本章节简要介绍协程实施的细节。这些细节藏在前文所提及的基础构件中。只要不影响API和ABI的兼容，实施细节可能随着时间而改变。
+
+### Continuation passing style
+
+挂起函数是通过Continuation-Passing-Stype (CPS)实现的。每个挂起函数和挂起lambda都有一个隐含的类型为Continuation的参数。例如，`await`的函数原型是这样的：
+
+```kotlin
+suspend fun <T> CompletableFuture<T>.await(): T
+```
+
+实际上，经过CPS变换之后的函数原型是这样的：
+
+```kotlin
+fun <T> CompletableFuture<T>.await(continuation: Continuation<T>): Any?
+```
+
+注意`Continuation`的类型参数也是`T`. 返回值类型`Any?`用来反映挂起函数的行动。当挂起函数挂起协程时，返回值是一个特殊标记值`COROUTINE_SUSPENDED`. 当挂起函数没有挂起，继续执行时，返回处理结果或异常。也就是说，`await`的返回值是`COROUTINE_SUSPENDED`和`T`的联合(union)，只能用`Any?`类型来表示。
+
+实际的实现方式，挂起函数不允许直接在栈上调用continuation，因为如果协程太深容易导致栈溢出。标准库众的`suspendCoroutine`负责处理这些细节问题，追踪continuation的调用执行，并且保证不管以何种方式在何时调用continuation，仍然满足前文所述的设计方式。
+
+### 状态机
+
+实现高效的协程是至关重要的，目标是创建尽可能少的对象和类。
