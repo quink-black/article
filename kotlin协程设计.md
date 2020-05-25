@@ -614,4 +614,4 @@ fun <T> CompletableFuture<T>.await(continuation: Continuation<T>): Any?
 
 ### 状态机
 
-实现高效的协程是至关重要的，目标是创建尽可能少的对象和类。
+用尽可能少的对象和类高效的实现协程是至关重要的。
