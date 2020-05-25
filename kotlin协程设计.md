@@ -456,3 +456,127 @@ suspend fun doSomething() {
 
 ### Continuation拦截器
 
+让我们再回顾下异步UI的用例。异步UI要求协程自身必须在UI线程执行，尽管协程内的挂起函数可以在其他线程恢复。这一要求由协程拦截器来保证。首先，我们要理解协程的生命周期。考虑如下使用`launch{}`协程builder的代码段：
+
+```kotlin
+launch(Swing) {
+    initialCode() // execution of initial code
+    f1.await() // suspension point #1
+    block1() // execution #1
+    f2.await() // suspension point #2
+    block2() // execution #2
+}
+```
+
+协程从`initialCode`开始执行，直到第一个挂起点。挂起一定时间后，协程恢复执行`block1`，然后再次挂起和恢复执行`block2`，之后结束。
+
+协程拦截器可以拦截和封装`initialCode`,`block1`, `block2`从恢复点到下个挂起点的continuation.协程的开头可以认为是从初始continuation的恢复点。标准库提供了` ContinuationInterceptor`接口：
+
+```kotlin
+interface ContinuationInterceptor : CoroutineContext.Element {
+    companion object Key : CoroutineContext.Key<ContinuationInterceptor>
+    fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T>
+    fun releaseInterceptedContinuation(continuation: Continuation<*>)
+}
+```
+
+`interceptContinuation`函数负责包装协程的continuation. 当协程挂起时，协程框架用如下代码包装实际的continuation，用于后续的恢复执行
+
+```kotlin
+val intercepted = continuation.context[ContinuationInterceptor]?.interceptContinuation(continuation) ?: continuation
+```
+
+协程框架缓存对应`continuation` 的`intercepted` continuation，并在适当时机通过`releaseInterceptedContinuation(intercepted)`来释放。细节详见后文。
+
+来看一个`Swing` 拦截器把代码段抛到Swing UI事件分发线程的例子。先看`SwingContinuation`包装类，通过`SwingUtilities.invokeLater`把实际的`cont`分发到UI线程：
+
+```kotlin
+private class SwingContinuation<T>(val cont: Continuation<T>) : Continuation<T> {
+    override val context: CoroutineContext = cont.context
+
+    override fun resumeWith(result: Result<T>) {
+        SwingUtilities.invokeLater { cont.resumeWith(result) }
+    }
+}
+```
+
+再看Swing对象，它是协程上下文的Element，同时实现了`ContinuationInterceptor`接口：
+
+```kotlin
+object Swing : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+    override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> =
+        SwingContinuation(continuation)
+}
+```
+
+接下来就可以把`Swing`作为参数传给协程builder`launch{}`，让协程在Swing UI事件分发线程执行：
+
+```kotlin
+launch(Swing) {
+  // 这里的代码可能挂起，但一定是在Swing UI线程恢复执行
+}
+```
+
+### 有限制的挂起
+
+要实现`sequence{}`和`yield()`以满足generator的用例需求，需要另一类协程builder和挂起函数。实现`sequence{}`协程builder的示例代码：
+
+```kotlin
+fun <T> sequence(block: suspend SequenceScope<T>.() -> Unit): Sequence<T> = Sequence {
+    SequenceCoroutine<T>().apply {
+        nextStep = block.createCoroutine(receiver = this, completion = this)
+    }
+}
+```
+
+`sequence`用了用了标准库的另一个原函数`createCoroutine`. `createCoroutine`和`startCoroutine`很相似，不同之处在于前者只创建协程，但不启动协程。它返回的是初始的*continuation*:
+
+```kotlin
+fun <T> (suspend () -> T).createCoroutine(completion: Continuation<T>): Continuation<Unit>
+fun <R, T> (suspend R.() -> T).createCoroutine(receiver: R, completion: Continuation<T>): Continuation<Unit>
+```
+
+另一个区别是，挂起lambda `block`是以`SequenceScope<T>`为receiver的扩展lambda. `SequenceScope`接口提供了generator代码块的`scope`:
+
+```
+interface SequenceScope<in T> {
+    suspend fun yield(value: T)
+}
+```
+
+为了避免创建多个对象，`SequenceCoroutine<T>`类同时实现了`SequenceScope<T>`接口和`Continuation<Unit>`接口，所以可同时作为`createCoroutine`的receiver和`completion`参数。简单实现如下：
+
+```kotlin
+private class SequenceCoroutine<T>: AbstractIterator<T>(), SequenceScope<T>, Continuation<Unit> {
+    lateinit var nextStep: Continuation<Unit>
+
+    // AbstractIterator implementation
+    override fun computeNext() { nextStep.resume(Unit) }
+
+    // Completion continuation implementation
+    override val context: CoroutineContext get() = EmptyCoroutineContext
+
+    override fun resumeWith(result: Result<Unit>) {
+        result.getOrThrow() // bail out on error
+        done()
+    }
+
+    // Generator implementation
+    override suspend fun yield(value: T) {
+        setNext(value)
+        return suspendCoroutine { cont -> nextStep = cont }
+    }
+}
+```
+
+`yield`的实现用了`suspendCoroutine`挂起函数来挂起协程，捕获它的continuation. Continuation存放在nextStep变量中，computeNext()被调用时执行`nextStep.resume()`.
+
+但要注意，`sequence{}`和`yield()`的工作方式是同步的，并非任意挂起函数可以捕获它们的continuation。continuation的捕获方式、存放方式和恢复时机是受到严格控制的，构成了有限制的挂起域。通过在scope的类或接口添加`@RestrictsSuspension`注解可以限制挂起方式，例如：
+
+```kotlin
+@RestrictsSuspension
+interface SequenceScope<in T> {
+    suspend fun yield(value: T)
+}
+```
+
