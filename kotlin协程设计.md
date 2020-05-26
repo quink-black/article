@@ -614,4 +614,67 @@ fun <T> CompletableFuture<T>.await(continuation: Continuation<T>): Any?
 
 ### 状态机
 
-用尽可能少的对象和类高效的实现协程是至关重要的。
+用尽可能少的对象和类高效的实现协程是至关重要的。许多编程语言是用状态机的形式来实现协程，Kotlin也采用此方案。每个挂起lambda只编译生成一个class，不论内部有多少个挂起点。
+
+核心思想：每个挂起函数编译生成一个状态机，每个挂起点对应一个状态。例如下面代码有两个挂起点：
+
+```kotlin
+val a = a()
+val y = foo(a).await() // 挂起点 #1
+b()
+val z = bar(a, y).await() // 挂起点 #2
+c(z)
+```
+
+上述代码有三个状态：
+
+* 初始状态（所有挂起点之前）
+* 第一个挂起点之后
+* 第二个挂起点之后
+
+每个状态对应一个continuation。
+
+上述代码编译成一个状态机匿名类。此匿名类用一个成员变量来记录当前状态，协程的局部变量也变成了匿名类的成员变量，目的是能够在多个状态中共享访问这些局部变量。下面是一段伪代码，描述编译后的挂起函数
+
+```kotlin
+class <anonymous_for_state_machine> extends SuspendLambda<...> {
+    // 状态机的当前状态
+    int label = 0
+    
+    // 协程局部变量
+    A a = null
+    Y y = null
+    
+    void resumeWith(Object result) {
+        if (label == 0) goto L0
+        if (label == 1) goto L1
+        if (label == 2) goto L2
+        else throw IllegalStateException()
+        
+      L0:
+        // result is expected to be `null` at this invocation
+        a = a()
+        label = 1
+        result = foo(a).await(this) // 'this' is passed as a continuation 
+        if (result == COROUTINE_SUSPENDED) return // return if await had suspended execution
+      L1:
+        // external code has resumed this coroutine passing the result of .await() 
+        y = (Y) result
+        b()
+        label = 2
+        result = bar(a, y).await(this) // 'this' is passed as a continuation
+        if (result == COROUTINE_SUSPENDED) return // return if await had suspended execution
+      L2:
+        // external code has resumed this coroutine passing the result of .await()
+        Z z = (Z) result
+        c(z)
+        label = -1 // No more steps are allowed
+        return
+    }          
+}    
+```
+
+伪代码描述的是编译后字节码的逻辑，所以用了goto和label.
+
+
+
