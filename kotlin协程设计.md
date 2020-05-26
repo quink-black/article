@@ -676,5 +676,135 @@ class <anonymous_for_state_machine> extends SuspendLambda<...> {
 
 伪代码描述的是编译后字节码的逻辑，所以用了goto和label.
 
+协程启动，调用`resumeWith()`，此时`label`是0，执行跳转到`L0`，完成一段运算后把状态`label`置为1，再调用`await()`. 如果调用`await()`协程被挂起，`resumeWith()`函数提前return. 如果要让协程继续执行，则再次调用`resumeWith()`，从`L1`标签开始执行，完成一段运算，把状态置为2，调用`await()`, 如果发生了挂起又再次return. 下次调用`resumeWith()`从`L3`开始执行，然后把状态置为-1，代表状态结束，没有后续工作了。
 
+处于循环内的挂起函数，也是只对应一个状态，因为循环本身也是用`goto`实现的。例如：
+
+```kotlin
+var x = 0
+while (x < 10) {
+    x += nextNumber().await()
+}
+```
+
+编译后的伪代码如下：
+
+```kotlin
+class <anonymous_for_state_machine> extends SuspendLambda<...> {
+    // The current state of the state machine
+    int label = 0
+    
+    // local variables of the coroutine
+    int x
+    
+    void resumeWith(Object result) {
+        if (label == 0) goto L0
+        if (label == 1) goto L1
+        else throw IllegalStateException()
+        
+      L0:
+        x = 0
+      LOOP:
+        if (x > 10) goto END
+        label = 1
+        result = nextNumber().await(this) // 'this' is passed as a continuation 
+        if (result == COROUTINE_SUSPENDED) return // return if await had suspended execution
+      L1:
+        // external code has resumed this coroutine passing the result of .await()
+        x += ((Integer) result).intValue()
+        label = -1
+        goto LOOP
+      END:
+        label = -1 // No more steps are allowed
+        return 
+    }          
+}    
+```
+
+
+
+### 挂起函数的编译
+
+如何编译挂起函数，取决于挂起函数调用其他挂起函数的方式和时机。最简单的情况是挂起函数在结尾调用其他挂起函数。实现底层同步原函数或者callback封装通常属于这一类，例如前文提到的 [suspending functions](https://github.com/Kotlin/KEEP/blob/master/proposals/coroutines.md#suspending-functions) 和[wrapping callbacks](https://github.com/Kotlin/KEEP/blob/master/proposals/coroutines.md#wrapping-callbacks). 这类函数在结尾调用其他挂起函数，编译此类挂起函数就像编译普通函数一样，只是把隐含的continuation参数透传给被调用的挂起函数。
+
+如果挂起函数不是在尾部调用其他挂起函数，则编译器会把此挂起函数编译成状态机。当此函数被调用时，创建一个状态机object；当此函数执行完时，丢弃状态机object。
+
+挂起函数调用其他挂起函数（非尾部挂起函数）时，创建的状态机object作为continuation参数传给其他挂起函数。多次调用其他挂起函数时，状态机被复用和更新。其他的异步编程模式，通常是每深入一层异步调用，新创建一个闭包，Kotlin复用状态机object的处理方式与它们不同。
+
+### 协程内部函数（intrinsics)
+
+协程标准库提供的`kotlin.coroutines.intrinsics` 包含协程实现的内部细节。本章节作一简要介绍，读者需慎重使用此包提供的函数，处于安全考虑，IDE的自动提示补全工具应当隐藏此包的内容。如果必须使用，需要手动添加import.
+
+```kotlin
+import kotlin.coroutines.intrinsics.*
+```
+
+`suspendCoroutine`函数是用Kotlin语言编写的，标准库包含它的源码。处于安全易用的考虑，它把状态机continuation又封装了一层。对于异步计算和`future`等用例，`suspendCoroutine`增加的一层封装所带来的开销相比于异步计算自身的开销可以忽略。但是对于`generator`的用例，`suspendCoroutine`所增加的开销就很可观了。对于性能敏感的底层操作，`kotlin.coroutines.intrinsics`可以用来做性能调优。
+
+`kotlin.coroutines.intrinsics`有一个`suspendCoroutineUninterceptedOrReturn`函数：
+
+```kotlin
+suspend fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) -> Any?): T
+```
+
+它暴露了未拦截的continuation，意味着调用`Continuation.resumeWith`是不经过`ContinuationInterceptor`处理的。它可以用来创建同步的协程：或者是有限制的挂起函数构成的同步协程（context为空，不能被拦截），或者已知期望的上下文就是当前线程的协程。否则的话，应当用`intercepted`扩展函数构造带拦截的continuation
+
+```
+fun <T> Continuation<T>.intercepted(): Continuation<T>
+```
+
+然后调用此函数返回的continuation的`resumeWith`.
+
+当`Continuation.resumeWith()`还没被调用时，`suspendCoroutineUninterceptedOrReturn`的参数`block`返回`COROUTINE_SUSPENDED`；如果`Continuation.resumeWith()`被调用了，则返回T或者异常。
+
+不遵守以上规则，可能导致难以追查和复现的bug. 像`buildSequence/yield`类似的场景，容易遵守上述规则，但对于类似`await`的异步挂起函数，则容易出错，此类场景请老老实实使用`suspendCoroutine`.
+
+还有一个`createCoroutineUnintercepted`方法：
+
+```kotlin
+fun <T> (suspend () -> T).createCoroutineUnintercepted(completion: Continuation<T>): Continuation<Unit>
+fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(receiver: R, completion: Continuation<T>): Continuation<Unit>
+```
+
+它和`createCoroutine`，但返回的是未拦截的continuation. 和`suspendCoroutineUninterceptedOrReturn`类似,它也是用在同步的场景做性能调优。例如优化`sequence{}`
+
+```kotin
+fun <T> sequence(block: suspend SequenceScope<T>.() -> Unit): Sequence<T> = Sequence {
+    SequenceCoroutine<T>().apply {
+        nextStep = block.createCoroutineUnintercepted(receiver = this, completion = this)
+    }
+}
+```
+通过`suspendCoroutineUninterceptedOrReturn`优化的`yield`如下。因为`yield`总是挂起，所以相应的代码块总是返回`COROUTINE_SUSPENDED`:
+```kotlin
+override suspend fun yield(value: T) {
+    setNext(value)
+    return suspendCoroutineUninterceptedOrReturn { cont ->
+        nextStep = cont
+        COROUTINE_SUSPENDED
+    }
+}
+```
+
+另外两个内部函数提供了底层的`startCoroutine`:
+
+```kotlin
+fun <T> (suspend () -> T).startCoroutineUninterceptedOrReturn(completion: Continuation<T>): Any?
+fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(receiver: R, completion: Continuation<T>): Any?
+```
+
+它们和`startCoroutine`有两点不同。第一没有自动添加`ContinuationInterceptor`，所以调用者要保证执行的上下文正确。第二，如果协程没挂起，它们返回处理结果或异常；如果协程挂起，返回`COROUTINE_SUSPENDED`.
+
+`startCoroutineUninterceptedOrReturn`多数情况下是和`suspendCoroutineUninterceptedOrReturn`配合使用，在同一个上下文执行不同的代码块：
+
+```kotlin
+suspend fun doSomething() = suspendCoroutineUninterceptedOrReturn { cont ->
+    // figure out or create a block of code that needs to be run
+    startCoroutineUninterceptedOrReturn(completion = block) // return result to suspendCoroutineUninterceptedOrReturn 
+}
+```
+
+## 附录
+
+// TODO
 
